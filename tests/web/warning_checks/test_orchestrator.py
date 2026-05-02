@@ -15,7 +15,8 @@ def _make_settings_manager(overrides=None):
         "llm.model": "llama3",
         "app.warnings.dismiss_high_context": False,
         "app.warnings.dismiss_model_mismatch": False,
-        "app.warnings.dismiss_context_reduced": False,
+        "app.warnings.dismiss_context_below_history": False,
+        "app.warnings.dismiss_context_truncation_history": False,
         "app.warnings.dismiss_legacy_config": False,
         "app.warnings.dismiss_no_backups": False,
         "app.warnings.dismiss_backup_disabled": False,
@@ -160,32 +161,35 @@ class TestCalculateWarningsProviderNormalization:
 class TestCalculateWarningsContextCheckGating:
     """Context checks are gated on is_local AND not dismissed."""
 
-    def test_context_checks_skipped_for_non_local_provider(self):
-        """Non-local provider should never trigger context history checks,
-        even when context is low and history would normally warn."""
+    def test_context_checks_run_for_non_local_provider(self):
+        """Non-local providers (OpenAI, Anthropic, OpenRouter) should also
+        trigger context history checks. Hosted providers can produce truncation
+        events via estimation-based detection in token_counter.py, so the
+        warning is meaningful for them too."""
         from local_deep_research.web.warning_checks import calculate_warnings
 
         mock_db_session = Mock()
+        # Stub out the DB queries the checks make so they return no warnings.
+        # The point of this test is to verify the checks RUN, not their output.
+        mock_db_session.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
+        mock_db_session.query.return_value.filter.return_value.filter.return_value.scalar.return_value = 0
 
         mgr = _make_settings_manager(
             {
                 "llm.provider": "openai",
                 "llm.local_context_window_size": 2048,
-                "app.warnings.dismiss_context_reduced": False,
             }
         )
         with _patch_orchestrator(mgr, db_session=mock_db_session):
-            warnings = calculate_warnings()
+            calculate_warnings()
 
-        # DB should not have been queried for context history at all
-        mock_db_session.query.assert_not_called()
-        assert not any(w["type"] == "context_below_history" for w in warnings)
-        assert not any(
-            w["type"] == "context_truncation_history" for w in warnings
-        )
+        # DB SHOULD have been queried — both context checks run for hosted
+        # providers now (no is_local gate).
+        assert mock_db_session.query.called
 
     def test_context_checks_skipped_when_dismissed(self):
-        """Local provider with dismiss_context_reduced=True should skip DB queries."""
+        """When both dismiss keys are True, both context history checks
+        should skip their DB queries."""
         from local_deep_research.web.warning_checks import calculate_warnings
 
         mock_db_session = Mock()
@@ -194,7 +198,8 @@ class TestCalculateWarningsContextCheckGating:
             {
                 "llm.provider": "ollama",
                 "llm.local_context_window_size": 2048,
-                "app.warnings.dismiss_context_reduced": True,
+                "app.warnings.dismiss_context_below_history": True,
+                "app.warnings.dismiss_context_truncation_history": True,
             }
         )
         with _patch_orchestrator(mgr, db_session=mock_db_session):
@@ -202,6 +207,33 @@ class TestCalculateWarningsContextCheckGating:
 
         mock_db_session.query.assert_not_called()
         assert not any(w["type"] == "context_below_history" for w in warnings)
+        assert not any(
+            w["type"] == "context_truncation_history" for w in warnings
+        )
+
+    def test_only_below_history_dismissal_still_runs_truncation_check(self):
+        """Dismissing one warning should not silence the other."""
+        from local_deep_research.web.warning_checks import calculate_warnings
+
+        mock_db_session = Mock()
+        # below_history check returns no records (no warning); truncation
+        # check returns a positive count → should warn.
+        mock_db_session.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
+        mock_db_session.query.return_value.filter.return_value.filter.return_value.scalar.return_value = 5
+
+        mgr = _make_settings_manager(
+            {
+                "llm.provider": "ollama",
+                "llm.local_context_window_size": 4096,
+                "app.warnings.dismiss_context_below_history": True,
+                "app.warnings.dismiss_context_truncation_history": False,
+            }
+        )
+        with _patch_orchestrator(mgr, db_session=mock_db_session):
+            warnings = calculate_warnings()
+
+        # Truncation history check ran and produced a warning.
+        assert any(w["type"] == "context_truncation_history" for w in warnings)
 
 
 class TestCalculateWarningsMultipleWarnings:
@@ -370,8 +402,8 @@ class TestCalculateWarningsSingleSession:
 
         mock_get_sm.assert_called_once_with(mock_db, "bob")
 
-    def test_all_seven_settings_read(self):
-        """All 7 required settings are read from the manager."""
+    def test_required_settings_read(self):
+        """All required settings are read from the manager."""
         from local_deep_research.web.warning_checks import calculate_warnings
 
         mgr = _make_settings_manager()
@@ -385,7 +417,8 @@ class TestCalculateWarningsSingleSession:
         assert "llm.model" in called_keys
         assert "app.warnings.dismiss_high_context" in called_keys
         assert "app.warnings.dismiss_model_mismatch" in called_keys
-        assert "app.warnings.dismiss_context_reduced" in called_keys
+        assert "app.warnings.dismiss_context_below_history" in called_keys
+        assert "app.warnings.dismiss_context_truncation_history" in called_keys
         assert "app.warnings.dismiss_legacy_config" in called_keys
 
 
@@ -512,7 +545,8 @@ class TestCalculateWarningsNoneProvider:
             "llm.model": "llama3",
             "app.warnings.dismiss_high_context": False,
             "app.warnings.dismiss_model_mismatch": False,
-            "app.warnings.dismiss_context_reduced": False,
+            "app.warnings.dismiss_context_below_history": False,
+            "app.warnings.dismiss_context_truncation_history": False,
         }.get(key, default)
 
         with _patch_orchestrator(mgr):

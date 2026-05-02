@@ -21,7 +21,6 @@ from .backup import (
     check_no_backups_exist,
 )
 from .hardware import (
-    LOCAL_PROVIDERS,
     check_high_context,
     check_legacy_server_config,
     check_model_mismatch,
@@ -67,8 +66,11 @@ def calculate_warnings() -> List[dict]:
             dismiss_model_mismatch = settings_manager.get_setting(
                 "app.warnings.dismiss_model_mismatch", False
             )
-            dismiss_context_warning = settings_manager.get_setting(
-                "app.warnings.dismiss_context_reduced", False
+            dismiss_context_below_history = settings_manager.get_setting(
+                "app.warnings.dismiss_context_below_history", False
+            )
+            dismiss_context_truncation_history = settings_manager.get_setting(
+                "app.warnings.dismiss_context_truncation_history", False
             )
             dismiss_legacy_config = settings_manager.get_setting(
                 "app.warnings.dismiss_legacy_config", False
@@ -84,8 +86,6 @@ def calculate_warnings() -> List[dict]:
             )
 
             logger.debug(f"Starting warning calculation - provider={provider}")
-
-            is_local = provider in LOCAL_PROVIDERS
 
             # --- Hardware / settings checks (pure functions) ---
             w = _safe_check(
@@ -160,13 +160,17 @@ def calculate_warnings() -> List[dict]:
                 logger.debug("Backup status check skipped")
 
             # --- History-based checks (need DB queries) ---
-            if is_local and not dismiss_context_warning:
+            # No is_local gate: hosted providers (OpenAI, Anthropic, OpenRouter)
+            # also produce truncation events via estimation-based detection in
+            # token_counter.py, so the warning is meaningful for them too.
+            if not dismiss_context_below_history:
                 w = _safe_check(
                     check_context_below_history, db_session, local_context
                 )
                 if w:
                     warnings.append(w)
 
+            if not dismiss_context_truncation_history:
                 w = _safe_check(
                     check_context_truncation_history, db_session, local_context
                 )
